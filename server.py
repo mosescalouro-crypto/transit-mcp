@@ -27,22 +27,35 @@ from x402.server import x402ResourceServer
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'transit.db')
 PORT = int(os.environ.get('TRANSIT_MCP_PORT', 8400))
+ZERO_EVM_ADDRESS = '0x0000000000000000000000000000000000000000'
 
-# x402 config
-PAY_TO_ADDRESS = os.environ.get('X402_PAY_TO', '0x0000000000000000000000000000000000000000')
+# x402 config. Pay-to must be provided; default network is Base mainnet.
+PAY_TO_ADDRESS = os.environ.get('X402_PAY_TO', '').strip()
 PRICE_TRANSIT = os.environ.get('X402_PRICE_TRANSIT', '$0.001')  # Transit: $0.001/query (free upstream data)
 PRICE_AIS = os.environ.get('X402_PRICE_AIS', '$0.01')           # AIS: $0.01/query (physical infrastructure, >100% margin)
 PRICE_ADSB = os.environ.get('X402_PRICE_ADSB', '$0.01')         # ADS-B: $0.01/query (physical infrastructure, >100% margin)
-NETWORK = os.environ.get('X402_NETWORK', 'eip155:84532')
+NETWORK = os.environ.get('X402_NETWORK', 'eip155:8453')
 FACILITATOR_URL = os.environ.get('X402_FACILITATOR', 'https://x402.org/facilitator')
 
 # Rate limiting (free tier)
 MAX_FREE_PER_MINUTE = 10
+MAX_RADIUS_TRANSIT_KM = 50.0
+MAX_RADIUS_AIS_KM = 200.0
+MAX_RADIUS_STOPS_KM = 100.0
 request_counts = {}
 
 
+def validate_payment_config():
+    """Refuse to serve paid routes without a real settlement address."""
+    if not PAY_TO_ADDRESS or PAY_TO_ADDRESS.lower() == ZERO_EVM_ADDRESS:
+        raise SystemExit(
+            'Refusing to start: set X402_PAY_TO to a real EVM address. '
+            'The zero-address default would burn payments.'
+        )
+
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -55,12 +68,21 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 
-def check_free_rate_limit(request: Request):
-    """Check if request is within free tier rate limit."""
-    # If x402 payment header is present, skip rate limiting
-    if request.headers.get('PAYMENT-SIGNATURE') or request.headers.get('X-PAYMENT'):
-        return True
+def clamp_radius_km(radius_km, max_km):
+    try:
+        radius_km = float(radius_km)
+    except (TypeError, ValueError):
+        return 1.0
+    if radius_km <= 0:
+        return 1.0
+    return min(radius_km, max_km)
 
+
+def check_free_rate_limit(request: Request):
+    """Check if request is within free tier rate limit.
+
+    Presence of a payment header is not treated as proof of payment.
+    """
     ip = request.client.host if request.client else 'unknown'
     now = datetime.now(timezone.utc)
     minute_key = now.strftime('%Y%m%d%H%M')
@@ -82,6 +104,7 @@ def check_free_rate_limit(request: Request):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_payment_config()
     print(f"Transit MCP Server v0.2.0 starting on port {PORT}")
     print(f"x402 payments: {NETWORK}, price: {PRICE_TRANSIT}, pay_to: {PAY_TO_ADDRESS}")
     print(f"Facilitator: {FACILITATOR_URL}")
@@ -142,7 +165,8 @@ x402_routes = {
         accepts=[ais_payment],
         description="Real-time AIS vessel positions from physical receiver network",
     ),
-    "GET /api/ais/vessel/{mmsi}": RouteConfig(
+    # x402 matches glob / :param / [param], not FastAPI {param} templates.
+    "GET /api/ais/vessel/*": RouteConfig(
         accepts=[ais_payment],
         description="Vessel details by MMSI",
     ),
@@ -345,6 +369,7 @@ async def mcp_tools():
 async def vehicles_near(request: Request, lat: float = 0, lon: float = 0,
                         radius_km: float = 2, limit: int = 50):
     limit = min(limit, 200)
+    radius_km = clamp_radius_km(radius_km, MAX_RADIUS_TRANSIT_KM)
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return JSONResponse({'error': 'lat/lon out of range'}, status_code=400)
 
@@ -510,6 +535,7 @@ async def ais_vessels_near(request: Request, lat: float = 0, lon: float = 0,
                            min_speed: float = None, limit: int = 50):
     """Get AIS vessel positions near a location. Data from physical receiver network."""
     limit = min(limit, 200)
+    radius_km = clamp_radius_km(radius_km, MAX_RADIUS_AIS_KM)
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return JSONResponse({'error': 'lat/lon out of range'}, status_code=400)
 
@@ -641,7 +667,11 @@ async def ais_vessel_detail(request: Request, mmsi: str):
 async def stream_vehicles(request: Request, lat: float = 0, lon: float = 0,
                           radius_km: float = 2, interval: int = 15):
     """Server-Sent Events stream of vehicle positions. Updates every interval seconds."""
+    if not check_free_rate_limit(request):
+        return JSONResponse({'error': 'rate limit exceeded'}, status_code=429)
+
     interval = max(5, min(interval, 60))
+    radius_km = clamp_radius_km(radius_km, MAX_RADIUS_TRANSIT_KM)
 
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return JSONResponse({'error': 'lat/lon out of range'}, status_code=400)
@@ -712,6 +742,7 @@ async def airports_near(request: Request, lat: float = None, lon: float = None,
                         radius_km: float = 50, q: str = None, limit: int = 20):
     """Search airports by location or name. Uses GTFS stops table for now."""
     limit = min(limit, 100)
+    radius_km = clamp_radius_km(radius_km, MAX_RADIUS_STOPS_KM)
     conn = get_db()
     c = conn.cursor()
 
