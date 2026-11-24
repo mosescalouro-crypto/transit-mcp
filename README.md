@@ -52,9 +52,10 @@ python server.py          # Start API server
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TRANSIT_MCP_PORT` | 8400 | API server port |
-| `X402_PAY_TO` | (required) | EVM address to receive USDC payments |
-| `X402_PRICE` | $0.001 | Price per query |
-| `X402_NETWORK` | eip155:8453 | Base mainnet |
+| `X402_PAY_TO` | (required) | EVM address to receive USDC payments. The server refuses to start without a real address. |
+| `X402_PRICE_TRANSIT` | $0.001 | Price per transit query |
+| `X402_PRICE_AIS` | $0.01 | Price per AIS query |
+| `X402_NETWORK` | eip155:8453 | Base mainnet. Set `eip155:84532` only for Base Sepolia testing. |
 | `X402_FACILITATOR` | https://x402.org/facilitator | x402 facilitator URL |
 
 ## Architecture
